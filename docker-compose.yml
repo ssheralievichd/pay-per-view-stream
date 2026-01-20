@@ -1,0 +1,34 @@
+services:
+  openresty:
+    image: openresty/openresty:alpine
+    container_name: pay-per-view-openresty
+    ports:
+      - "8080:80"
+    volumes:
+      - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./lua:/etc/nginx/lua:ro
+      - ./logs:/usr/local/openresty/nginx/logs
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - stream-network
+
+  redis:
+    image: redis:alpine
+    container_name: pay-per-view-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - stream-network
+
+networks:
+  stream-network:
+    driver: bridge
+
+volumes:
+  redis-data:
