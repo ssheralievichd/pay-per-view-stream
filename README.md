@@ -5,23 +5,152 @@ An OpenResty-based stream proxy that dynamically routes requests to backend serv
 ## Architecture
 
 ```
-Client Request → OpenResty → Redis Lookup → Dynamic Upstream Proxy
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PAY-PER-VIEW STREAM PROXY                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────┐         ┌─────────────────┐         ┌──────────────────┐
+    │  Client  │         │    OpenResty    │         │  Stream Server   │
+    │          │         │                 │         │                  │
+    │  Browser │────────▶│  /stream/abc123 │────────▶│  10.0.0.5:8080   │
+    │  Player  │◀────────│                 │◀────────│                  │
+    │          │         │                 │         │                  │
+    └──────────┘         └────────┬────────┘         └──────────────────┘
+                                  │
+                                  │ GET streams:abc123
+                                  ▼
+                         ┌─────────────────┐
+                         │      Redis      │
+                         │                 │
+                         │  streams:abc123 │
+                         │  = 10.0.0.5:8080│
+                         │                 │
+                         └─────────────────┘
 ```
 
-1. Client requests `/stream/{stream_id}`
-2. Lua script queries Redis for `streams:{stream_id}`
-3. Redis returns the upstream address (e.g., `192.168.1.100:8080`)
-4. Request is proxied to the resolved upstream
+### Request Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              REQUEST LIFECYCLE                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  1. INCOMING REQUEST
+  ════════════════════
+
+     GET /stream/live001 HTTP/1.1
+     Host: localhost:8080
+              │
+              ▼
+  ┌─────────────────────────────────────┐
+  │           OPENRESTY                 │
+  │  ┌───────────────────────────────┐  │
+  │  │     nginx.conf                │  │
+  │  │  location ~ /stream/(.+)      │  │
+  │  │     ↓                         │  │
+  │  │  access_by_lua_file           │  │
+  │  │     stream_proxy.lua          │  │
+  │  └───────────────────────────────┘  │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  2. REDIS LOOKUP
+  ════════════════════
+
+  ┌─────────────────────────────────────┐
+  │         stream_proxy.lua            │
+  │                                     │
+  │  local key = "streams:" .. "live001"│
+  │  local upstream = red:get(key)      │
+  │         │                           │
+  └─────────┼───────────────────────────┘
+            │
+            │  GET streams:live001
+            ▼
+  ┌─────────────────────────────────────┐
+  │              REDIS                  │
+  │  ┌───────────────────────────────┐  │
+  │  │  streams:live001              │  │
+  │  │  ────────────────             │  │
+  │  │  "192.168.1.50:8080"          │  │
+  │  └───────────────────────────────┘  │
+  └──────────────┬──────────────────────┘
+                 │
+                 │  Returns: "192.168.1.50:8080"
+                 ▼
+  3. DYNAMIC PROXY
+  ════════════════════
+
+  ┌─────────────────────────────────────┐
+  │           OPENRESTY                 │
+  │                                     │
+  │  ngx.ctx.upstream_host = "192..."   │
+  │  ngx.ctx.upstream_port = 8080       │
+  │         │                           │
+  │         ▼                           │
+  │  ┌───────────────────────────────┐  │
+  │  │   balancer_by_lua_block       │  │
+  │  │   set_current_peer(host,port) │  │
+  │  └───────────────────────────────┘  │
+  │         │                           │
+  └─────────┼───────────────────────────┘
+            │
+            │  proxy_pass
+            ▼
+  ┌─────────────────────────────────────┐
+  │         UPSTREAM SERVER             │
+  │         192.168.1.50:8080           │
+  │                                     │
+  │         [Stream Content]            │
+  └─────────────────────────────────────┘
+```
+
+### Docker Network
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            DOCKER COMPOSE NETWORK                           │
+│                              stream-network                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────────────────┐      ┌─────────────────────────────┐     │
+│   │     pay-per-view-openresty  │      │     pay-per-view-redis      │     │
+│   │                             │      │                             │     │
+│   │   ┌─────────────────────┐   │      │   ┌─────────────────────┐   │     │
+│   │   │     OpenResty       │   │      │   │       Redis         │   │     │
+│   │   │                     │   │      │   │                     │   │     │
+│   │   │  Port 80 (internal) │◀─┼──────┼──▶│  Port 6379           │   │     │
+│   │   │                     │   │      │   │                     │   │     │
+│   │   └─────────────────────┘   │      │   └─────────────────────┘   │     │
+│   │             │               │      │             │               │     │
+│   └─────────────┼───────────────┘      └─────────────┼───────────────┘     │
+│                 │                                    │                     │
+└─────────────────┼────────────────────────────────────┼─────────────────────┘
+                  │                                    │
+                  │ :8080                              │ :6379
+                  ▼                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                               HOST MACHINE                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Project Structure
 
 ```
+pay-per-view-stream/
+│
 ├── conf/
-│   └── nginx.conf          # OpenResty configuration
+│   └── nginx.conf            # OpenResty configuration
+│
 ├── lua/
-│   └── stream_proxy.lua    # Redis lookup and proxy logic
-├── logs/                   # Nginx logs (gitignored)
-├── docker-compose.yml      # Service definitions
+│   └── stream_proxy.lua      # Redis lookup and proxy logic
+│
+├── logs/                     # Nginx logs (gitignored)
+│   ├── access.log
+│   └── error.log
+│
+├── docker-compose.yml        # Service definitions
+├── .gitignore
 └── README.md
 ```
 
@@ -60,6 +189,22 @@ curl http://localhost:8080/stream/live001
 The request will be proxied to `10.0.0.5:8000`.
 
 ## Redis Key Format
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        REDIS SCHEMA                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   KEY                          VALUE                            │
+│   ───                          ─────                            │
+│                                                                 │
+│   streams:live001      ───▶    "192.168.1.50:8080"              │
+│   streams:sports_hd    ───▶    "10.0.0.100:9000"                │
+│   streams:news_24h     ───▶    "backend.local:8080"             │
+│   streams:movie_abc    ───▶    "172.16.0.5"  (port defaults 80) │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 | Key Pattern | Value Format | Example |
 |-------------|--------------|---------|
@@ -100,6 +245,24 @@ docker exec pay-per-view-redis redis-cli KEYS "streams:*"
 
 ## API Endpoints
 
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         API ROUTES                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   GET /health                                                   │
+│   ├── 200 OK                                                    │
+│   └── Health check endpoint                                     │
+│                                                                 │
+│   GET /stream/{stream_id}                                       │
+│   ├── 200 ─── Proxied response from upstream                    │
+│   ├── 400 ─── Missing stream_id                                 │
+│   ├── 404 ─── Stream not found in Redis                         │
+│   └── 500 ─── Internal error                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### GET /stream/{stream_id}
 
 Proxies the request to the upstream associated with the stream ID.
@@ -115,6 +278,42 @@ Proxies the request to the upstream associated with the stream ID.
 Health check endpoint.
 
 **Response:** `200 OK`
+
+## Error Handling
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ERROR SCENARIOS                            │
+└─────────────────────────────────────────────────────────────────┘
+
+  Stream Not Found                    Redis Connection Failed
+  ══════════════════                  ══════════════════════════
+
+  Client ──▶ OpenResty ──▶ Redis      Client ──▶ OpenResty ──X Redis
+                 │            │                       │
+                 │   "nil"    │                       │  timeout
+                 │◀───────────┘                       │
+                 │                                    │
+                 ▼                                    ▼
+           ┌──────────┐                        ┌──────────┐
+           │ 404 Not  │                        │ 500 Error│
+           │  Found   │                        │          │
+           └──────────┘                        └──────────┘
+
+
+  Invalid Upstream Format
+  ══════════════════════════
+
+  Redis returns: "invalid:format:here"
+                       │
+                       ▼
+                ┌──────────────┐
+                │  Parse Error │
+                │      │       │
+                │      ▼       │
+                │  500 Error   │
+                └──────────────┘
+```
 
 ## Logs
 
